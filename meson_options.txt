@@ -164,6 +164,8 @@ option('quotacheck', type : 'boolean',
        description : 'support for the quotacheck tools')
 option('sysusers', type : 'boolean',
        description : 'support for the sysusers configuration')
+option('with-tcb', type : 'boolean',
+       description : 'tcb schema support (used in systemd-sysusers)')
 option('storagetm', type : 'boolean',
        description : 'support for Storage Target Mode')
 option('tmpfiles', type : 'boolean',

@@ -28,6 +28,8 @@
 #include "loop-util.h"
 #include "main-func.h"
 #include "mount-util.h"
+#include "mkdir-label.h"
+#include "dirent-util.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "path-util.h"
@@ -131,6 +133,8 @@ typedef struct Context {
         UGIDAllocationRange login_defs;
         bool login_defs_need_warning;
 } Context;
+
+static int get_gid_by_name(Context *c, const char *name, gid_t *ret_gid);
 
 static void context_done(Context *c) {
         assert(c);
@@ -608,6 +612,237 @@ static usec_t epoch_or_now(void) {
         return now(CLOCK_REALTIME);
 }
 
+#if ENABLE_WITH_TCB
+static int add_tcb_user(
+        Context *c,
+        struct spwd *sp,
+        uid_t uid_user,
+        const char *tcb_path) {
+
+        assert (c);
+
+        _cleanup_closedir_ DIR *tcb_dir = NULL;
+        _cleanup_fclose_ FILE *shadow = NULL;
+        _cleanup_free_  char *shadow_path = NULL;
+        _cleanup_free_  char *shadow_dir_path = NULL;
+        _cleanup_strv_free_ char **tcb_current_entries = NULL;
+        int r;
+        gid_t auth_gid;
+
+        tcb_dir = opendir(tcb_path);
+        if (!tcb_dir) {
+                if (errno == ENOENT)
+                        return 0;
+
+                return log_debug_errno(errno, "Failed to open directory '%s': %m", tcb_path);
+        }
+
+        /* Get all names from /etc/tcb */
+        FOREACH_DIRENT_ALL(de, tcb_dir, return log_error_errno(errno, "Failed to read %s: %m", tcb_path)) {
+                _cleanup_free_ char *name = NULL;
+                _cleanup_close_ int fd = -EBADF;
+
+                if (dot_or_dot_dot(de->d_name))
+                        continue;
+
+                name = strdup(de->d_name);
+                if (!name)
+                        return log_oom();
+
+                strv_extend (&tcb_current_entries, name);
+        }
+
+        if strv_contains (tcb_current_entries, sp->sp_namp)
+                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
+                                       "%s: User \"%s\" already exists.",
+                                       tcb_path, sp->sp_namp);
+
+        shadow_dir_path = path_join(tcb_path, sp->sp_namp);
+        r = mkdir_p(shadow_dir_path, 0700);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create \"%s\": %m", shadow_dir_path);
+
+        r = get_gid_by_name (c, "auth", &auth_gid);
+        if (r < 0)
+                return log_error_errno(r, "Group auth not found.");
+
+        r = chmod_and_chown(shadow_dir_path, 02710, uid_user, auth_gid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to change ownership and mode of \"%s\": %m", shadow_dir_path);
+
+        shadow_path = path_join(shadow_dir_path, "shadow");
+        shadow = fopen(shadow_path, "we");
+        if (!shadow)
+                return log_error_errno(errno, "Failed to open \"%s\" for writing: %m", shadow_path);
+
+        r = chmod_and_chown(shadow_path, 0640, uid_user, auth_gid);
+        if (r < 0)
+                return log_error_errno(r, "Failed to change ownership and mode of \"%s\": %m", shadow_path);
+
+        r = putspent_sane(sp, shadow);
+
+        r = fflush_sync_and_check(shadow);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to flush %s: %m", shadow_path);
+
+        return r;
+}
+
+static int write_temporary_tcb_existing_shadow(
+        Context *c,
+        const char *tcb_path,
+        char ***tcb_shadow_paths,
+        char ***tcb_shadow_temp_paths) {
+
+        assert (c);
+
+        _cleanup_closedir_ DIR *tcb_dir = NULL;
+        long lstchg;
+        struct spwd *sp = NULL;
+        Item *i;
+        int r;
+
+        tcb_dir = opendir(tcb_path);
+        if (!tcb_dir) {
+                if (errno == ENOENT)
+                        return 0;
+
+                return log_debug_errno(errno, "Failed to open directory '%s': %m", tcb_path);
+        }
+
+        lstchg = (long) (epoch_or_now() / USEC_PER_DAY);
+
+        /* Update entries from /etc/tcb */
+        FOREACH_DIRENT_ALL(de, tcb_dir, return log_error_errno(errno, "Failed to read %s: %m", tcb_path)) {
+                _cleanup_free_ char *name = NULL;
+                _cleanup_close_ int fd = -EBADF;
+
+                if (dot_or_dot_dot(de->d_name))
+                        continue;
+
+                name = strdup(de->d_name);
+                if (!name)
+                        return log_oom();
+
+                i = ordered_hashmap_get(c->users, name);
+                if (i && i->todo_user) {
+                        /* we will update the existing entry */
+                        _cleanup_fclose_ FILE *original = NULL, *shadow = NULL;
+                        _cleanup_free_ char *shadow_path = path_join(tcb_path, name, "shadow");
+                        _cleanup_free_ char *target_shadow_path = path_join("/etc/tcb/", name, "shadow");
+                        _cleanup_free_ char *shadow_tmp_path = NULL;
+
+                        original = fopen(shadow_path, "re");
+                        if (original) {
+                                r = fopen_temporary_label(target_shadow_path, shadow_path, &shadow, &shadow_tmp_path);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to open temporary copy of %s: %m", shadow_path);
+
+                                r = copy_rights_with_fallback(fileno(original), fileno(shadow), shadow_tmp_path);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to copy permissions from %s to %s: %m",
+                                                               shadow_path, shadow_tmp_path);
+
+                                r = fgetspent_sane(original, &sp);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to read %s: %m", shadow_path);
+                                sp->sp_lstchg = lstchg;
+
+                                /* only the /etc/tcb/<user>/shadow stage is left, so we can
+                                 * safely remove the item from the todo set */
+                                i->todo_user = false;
+                                ordered_hashmap_remove(c->todo_uids, UID_TO_PTR(i->uid));
+
+                                r = putspent_sane(sp, shadow);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to add existing user \"%s\" to temporary tcb shadow file: %m",
+                                                               sp->sp_namp);
+
+                                r = fflush_sync_and_check(shadow);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to flush %s: %m", shadow_tmp_path);
+
+
+                                r = strv_extend(tcb_shadow_temp_paths, shadow_tmp_path);
+                                if (r < 0)
+                                        return r;
+
+                                r = strv_extend(tcb_shadow_paths, shadow_path);
+                                if (r < 0)
+                                        return r;
+                        }
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to read %s: %m", shadow_path);
+                }
+        }
+
+        return 0;
+}
+
+static int write_tcb_shadow(
+                Context *c,
+                const char *tcb_dir_path) {
+
+        long lstchg;
+        Item *i;
+        int r;
+
+        assert(c);
+
+        if (ordered_hashmap_isempty(c->todo_uids))
+                return 0;
+
+        lstchg = (long) (epoch_or_now() / USEC_PER_DAY);
+
+        if (arg_dry_run) {
+                log_info("Would write /etc/tcb/<user>/shadow%s", glyph(GLYPH_ELLIPSIS));
+                return 0;
+        }
+
+        /* Add new entries in /etc/tcb */
+        ORDERED_HASHMAP_FOREACH(i, c->todo_uids) {
+                _cleanup_(erase_and_freep) char *creds_password = NULL;
+                bool is_hashed;
+
+                struct spwd n = {
+                        .sp_namp = i->name,
+                        .sp_lstchg = lstchg,
+                        .sp_min = -1,
+                        .sp_max = -1,
+                        .sp_warn = -1,
+                        .sp_inact = -1,
+                        .sp_expire = i->locked ? 1 : -1, /* Negative expiration means "unset". Expiration 0 or 1 means "locked" */
+                        .sp_flag = ULONG_MAX, /* this appears to be what everybody does ... */
+                };
+
+                r = get_credential_user_password(i->name, &creds_password, &is_hashed);
+                if (r < 0)
+                        log_debug_errno(r, "Couldn't read password credential for user '%s', ignoring: %m", i->name);
+
+                if (creds_password && !is_hashed) {
+                        _cleanup_(erase_and_freep) char* plaintext_password = TAKE_PTR(creds_password);
+                        r = hash_password(plaintext_password, &creds_password);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to hash password: %m");
+                }
+
+                if (creds_password)
+                        n.sp_pwdp = creds_password;
+                else if (streq(i->name, "root"))
+                        /* Let firstboot set the password later */
+                        n.sp_pwdp = (char*) PASSWORD_UNPROVISIONED;
+                else
+                        n.sp_pwdp = (char*) PASSWORD_LOCKED_AND_INVALID;
+
+                r = add_tcb_user (c, &n, i->uid, tcb_dir_path);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to add new user \"%s\" to tcb shadow file: %m",
+                                               i->name);
+        }
+
+        return 0;
+}
+#else
 static int write_temporary_shadow(
                 Context *c,
                 const char *shadow_path,
@@ -742,6 +977,7 @@ static int write_temporary_shadow(
 
         return 0;
 }
+#endif
 
 static int write_temporary_group(
                 Context *c,
@@ -946,15 +1182,22 @@ static int write_temporary_gshadow(
 static int write_files(Context *c) {
         _cleanup_fclose_ FILE *passwd = NULL, *group = NULL, *shadow = NULL, *gshadow = NULL;
         _cleanup_(unlink_and_freep) char *passwd_tmp = NULL, *group_tmp = NULL, *shadow_tmp = NULL, *gshadow_tmp = NULL;
+        _cleanup_strv_free_ char **temp_tcb_shadow_paths = NULL, **tcb_shadow_paths = NULL;
         int r;
 
         _cleanup_free_ char *passwd_path = path_join(arg_root, "/etc/passwd");
         if (!passwd_path)
                 return log_oom();
 
+#if ENABLE_WITH_TCB
+        _cleanup_free_ char *tcb_path = path_join(arg_root, "/etc/tcb");
+        if (!tcb_path)
+                return log_oom();
+#else
         _cleanup_free_ char *shadow_path = path_join(arg_root, "/etc/shadow");
         if (!shadow_path)
                 return log_oom();
+#endif
 
         _cleanup_free_ char *group_path = path_join(arg_root, "/etc/group");
         if (!group_path)
@@ -978,9 +1221,21 @@ static int write_files(Context *c) {
         if (r < 0)
                 return r;
 
+#if ENABLE_WITH_TCB
+        /* Update existing entries */
+        r = write_temporary_tcb_existing_shadow (c, tcb_path, &tcb_shadow_paths, &temp_tcb_shadow_paths);
+        if (r < 0)
+                return r;
+        /* No temporary files need to be generated to create new entries, so all the logic
+         * for adding a shadow file for a new user is in this function */
+        r = write_tcb_shadow(c, tcb_path);
+        if (r < 0)
+                return r;
+#else
         r = write_temporary_shadow(c, shadow_path, &shadow, &shadow_tmp);
         if (r < 0)
                 return r;
+#endif
 
         /* Make a backup of the old files */
         if (group) {
@@ -999,12 +1254,33 @@ static int write_files(Context *c) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", passwd_path);
         }
+#if ENABLE_WITH_TCB
+        if (tcb_shadow_paths) {
+                _cleanup_strv_free_ char **tcb_shadow_path_split = NULL;
+                _cleanup_free_  char *target_tcb_shadow_path = NULL;
+                STRV_FOREACH(tcb_shadow_path, tcb_shadow_paths) {
+                        tcb_shadow_path_split = strv_split(*tcb_shadow_path, "/");
+
+                        if (!tcb_shadow_path_split)
+                                return -ENOMEM;
+
+                        target_tcb_shadow_path = path_join("/etc/tcb/",
+                                                           tcb_shadow_path_split[strv_length(tcb_shadow_path_split) - 2],
+                                                           "shadow");
+
+                        r = make_backup(target_tcb_shadow_path, *tcb_shadow_path);
+
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to backup %s: %m", *tcb_shadow_path);
+                }
+        }
+#else
         if (shadow) {
                 r = make_backup("/etc/shadow", shadow_path);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", shadow_path);
         }
-
+#endif
         /* And make the new files count */
         if (group) {
                 r = rename_and_apply_smack_floor_label(group_tmp, group_path);
@@ -1034,6 +1310,28 @@ static int write_files(Context *c) {
         }
         /* OK, we have written the user entries successfully */
         log_audit_accounts(c, ADD_USER);
+#if ENABLE_WITH_TCB
+        if (tcb_shadow_paths) {
+                _cleanup_strv_free_ char **temp_tcb_shadow_path_split = NULL;
+                _cleanup_free_  char *target_tcb_shadow_path = NULL;
+                STRV_FOREACH(temp_tcb_shadow_path, temp_tcb_shadow_paths) {
+                        temp_tcb_shadow_path_split = strv_split(*temp_tcb_shadow_path, "/");
+
+                        if (!temp_tcb_shadow_path_split)
+                                return -ENOMEM;
+
+                        target_tcb_shadow_path = path_join(tcb_path,
+                                                           temp_tcb_shadow_path_split[strv_length(temp_tcb_shadow_path_split) - 2],
+                                                           "shadow");
+
+                        r = rename_and_apply_smack_floor_label(*temp_tcb_shadow_path, target_tcb_shadow_path);
+
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to rename %s to %s: %m",
+                                                       *temp_tcb_shadow_path, target_tcb_shadow_path);
+                }
+        }
+#else
         if (shadow) {
                 r = rename_and_apply_smack_floor_label(shadow_tmp, shadow_path);
                 if (r < 0)
@@ -1042,6 +1340,7 @@ static int write_files(Context *c) {
 
                 shadow_tmp = mfree(shadow_tmp);
         }
+#endif
 
         return 0;
 }
