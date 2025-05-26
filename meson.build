@@ -1632,6 +1632,7 @@ foreach term : ['analyze',
                 'userdb',
                 'utmp',
                 'vconsole',
+                'with-tcb',
                 'xdg-autostart']
         have = get_option(term)
         name = 'ENABLE_' + term.underscorify().to_upper()
